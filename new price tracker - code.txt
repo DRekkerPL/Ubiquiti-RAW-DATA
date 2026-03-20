@@ -1,0 +1,507 @@
+DROP TABLE IF EXISTS #LTM_Turnover,
+                     #JournalData,
+                     #LowestPrice,
+                     #Line_Level_Margins,
+                     #Median_Achieved_Margin,
+                     #Sales_Only_Median_Margin,
+                     #All_Margin_Inputs,
+                     #Base_Margin_Calc,
+                     #Calculated_Margins,
+                     #Final_Anchor_Buckets,
+                     #Interpolation_Setup;
+GO
+
+SELECT [Item No.] AS [ItemNo],
+       SUM([Turnover (DKK)]) AS [LTM Turnover (DKK)]
+INTO #LTM_Turnover
+FROM [PricingData].[dbo].[Pricing_Business_Intelligence_Auto_Table]
+WHERE [Posting Date] >= DATEADD(MONTH, -12, CAST(GETDATE() AS DATE))
+GROUP BY [Item No.];
+
+
+SELECT ManufacturerPartNo,
+       EAN,
+       Price AS TargetPrice
+INTO #JournalData
+FROM
+(
+    SELECT ManufacturerPartNo,
+           EAN,
+           Price,
+           ROW_NUMBER() OVER (PARTITION BY ManufacturerPartNo ORDER BY ImportDate DESC) AS RowNum
+    FROM [PROD-SQL-07].[Controlling].[dbo].[Wimood_Price_Feed]
+    WHERE Price > 0
+) AS Feed
+WHERE RowNum = 1;
+
+
+SELECT [manufacturerSKU],
+       [supplierName],
+       [price],
+       ROW_NUMBER() OVER (PARTITION BY [manufacturerSKU]
+                          ORDER BY TRY_CAST([price] AS FLOAT) ASC
+                         ) AS RowNum
+INTO #LowestPrice
+FROM [PROD-SQL-07].[Controlling].[dbo].[ITScope_CompData_temp]
+WHERE supplierName IN ( 'ALLNET Deutschland', 'api Deutschland', 'Wortmann AG', 'ALSO Deutschland' )
+      AND TRY_CONVERT(DATE, [extraction_date], 112) >= DATEADD(DAY, -14, GETDATE());
+
+
+SELECT [Item No.] AS [ItemNo],
+       CASE
+           WHEN [Turnover (LCY)] > 0 THEN
+       ([Sales Profit (LCY)] / ([Turnover (LCY)] - [Sales Profit (LCY)])) * 100
+           ELSE
+               0
+       END AS LineMarginPct_Markup
+INTO #Line_Level_Margins
+FROM [PricingData].[dbo].[Pricing_Business_Intelligence_Auto_Table]
+WHERE [Business Unit] IN ( 'FR', 'BE', 'NL', 'DE', 'UK', 'SE' )
+      AND [Posting Date] >= DATEADD(MONTH, -12, GETDATE())
+      AND ([Turnover (LCY)] - [Sales Profit (LCY)]) > 0;
+
+
+SELECT [ItemNo],
+       PERCENTILE_CONT(0.5)WITHIN GROUP(ORDER BY LineMarginPct_Markup ASC) OVER (PARTITION BY [ItemNo]) AS MedianAchievedMarginPct
+INTO #Median_Achieved_Margin
+FROM #Line_Level_Margins;
+
+
+SELECT DISTINCT
+       [ItemNo],
+       MedianAchievedMarginPct
+INTO #Sales_Only_Median_Margin
+FROM #Median_Achieved_Margin;
+
+
+SELECT i.[No.] AS [ItemNo],
+       i.[Manufacturer Part No],
+       cp.[CostPrice],
+       lp.[supplierName],
+       CASE
+           WHEN lp.[price] IS NOT NULL
+                AND TRY_CAST(lp.[price] AS FLOAT) > 0
+                AND cp.CostPrice > 0 THEN
+       ((TRY_CAST(lp.[price] AS FLOAT) / cp.CostPrice) - 1) * 100
+           ELSE
+               NULL
+       END AS RawCompetitorMarginPct,
+       CASE
+           WHEN COALESCE(jd_part.TargetPrice, jd_ean.TargetPrice) > 0
+                AND cp.CostPrice > 0
+                AND ((COALESCE(jd_part.TargetPrice, jd_ean.TargetPrice) / cp.CostPrice) - 1) * 100 < 30.0 THEN
+       ((COALESCE(jd_part.TargetPrice, jd_ean.TargetPrice) / cp.CostPrice) - 1) * 100
+           ELSE
+               NULL
+       END AS TargetMarginPct,
+       am.MedianAchievedMarginPct
+INTO #All_Margin_Inputs
+FROM [NAVI-READ-ONLY].[WebDE].[dbo].[Costprices] cp
+    JOIN [NAVI-READ-ONLY].[financialsdk].[dbo].[EET Germany$Item] i
+        ON i.[No.] COLLATE SQL_Latin1_General_CP1_CI_AS = cp.[ItemNo] COLLATE SQL_Latin1_General_CP1_CI_AS
+    LEFT JOIN
+    (SELECT * FROM #LowestPrice WHERE RowNum = 1) lp
+        ON i.[Manufacturer Part No] COLLATE SQL_Latin1_General_CP1_CI_AS = lp.[manufacturerSKU] COLLATE SQL_Latin1_General_CP1_CI_AS
+    LEFT JOIN #Sales_Only_Median_Margin am
+        ON i.[No.] = am.[ItemNo]
+    LEFT JOIN #JournalData jd_part
+        ON i.[Manufacturer Part No] COLLATE SQL_Latin1_General_CP1_CI_AS = jd_part.ManufacturerPartNo COLLATE SQL_Latin1_General_CP1_CI_AS
+    LEFT JOIN #JournalData jd_ean
+        ON i.[EAN/UPC] COLLATE SQL_Latin1_General_CP1_CI_AS = jd_ean.EAN COLLATE SQL_Latin1_General_CP1_CI_AS
+WHERE i.[Brand No.] = '45790'
+      AND i.[Blocking] NOT IN ( 1, 4 )
+      AND i.[Process Method Code] <> 'UBQT_EXC'
+      AND i.[No.] NOT LIKE '%-C1';
+
+
+SELECT *,
+       CASE
+           WHEN RawCompetitorMarginPct IS NOT NULL THEN
+               CASE
+                   WHEN MedianAchievedMarginPct IS NOT NULL
+                        AND MedianAchievedMarginPct > 0
+                        AND RawCompetitorMarginPct
+                        BETWEEN (MedianAchievedMarginPct * 0.4) AND (MedianAchievedMarginPct * 1.6) THEN
+                       RawCompetitorMarginPct
+                   WHEN MedianAchievedMarginPct IS NULL
+                        AND RawCompetitorMarginPct
+                        BETWEEN 2.0 AND 15.0 THEN
+                       RawCompetitorMarginPct
+                   ELSE
+                       NULL
+               END
+           ELSE
+               NULL
+       END AS CompetitorMarginPct,
+       CASE
+           WHEN RawCompetitorMarginPct IS NULL THEN
+               CASE
+                   WHEN TargetMarginPct IS NOT NULL THEN
+                       'No Main Competitor'
+                   ELSE
+                       'No Competitor Data'
+               END
+           WHEN MedianAchievedMarginPct IS NOT NULL
+                AND MedianAchievedMarginPct > 0
+                AND RawCompetitorMarginPct
+                BETWEEN (MedianAchievedMarginPct * 0.4) AND (MedianAchievedMarginPct * 1.6) THEN
+               'Used'
+           WHEN MedianAchievedMarginPct IS NULL
+                AND RawCompetitorMarginPct
+                BETWEEN 2.0 AND 15.0 THEN
+               'Used'
+           ELSE
+               'Outlier - Excluded'
+       END AS CompetitorStatus
+INTO #Base_Margin_Calc
+FROM #All_Margin_Inputs;
+
+-- ========================================================
+-- FIX APPLIED HERE: Replaced RawCompetitorMarginPct 
+-- with CompetitorMarginPct so Outliers are properly ignored
+-- ========================================================
+SELECT *,
+       (
+           SELECT MIN(v)
+           FROM
+           (
+               VALUES
+                   (CompetitorMarginPct),
+                   (TargetMarginPct),
+                   (MedianAchievedMarginPct)
+           ) AS value (v)
+       ) AS SMB01_BaseMargin,
+       ROUND(   CASE
+                    WHEN CompetitorMarginPct IS NOT NULL
+                         AND MedianAchievedMarginPct IS NOT NULL THEN
+                (CompetitorMarginPct * 0.40) + (MedianAchievedMarginPct * 0.60)
+                    WHEN MedianAchievedMarginPct IS NOT NULL THEN
+                        MedianAchievedMarginPct
+                    WHEN CompetitorMarginPct IS NOT NULL THEN
+                        CompetitorMarginPct
+                    ELSE
+                        7.5
+                END,
+                2
+            ) AS Core_BaseMargin
+INTO #Calculated_Margins
+FROM #Base_Margin_Calc;
+
+
+SELECT *,
+       CASE
+           WHEN ISNULL(SMB01_BaseMargin, 7.5) < 2.5 THEN
+               2.5
+           WHEN ISNULL(SMB01_BaseMargin, 7.5) > 13 THEN
+               13
+           ELSE
+               ISNULL(SMB01_BaseMargin, 7.5)
+       END AS Initial_SMB01,
+       CASE
+           WHEN Core_BaseMargin < 3.5 THEN
+               3.5
+           WHEN Core_BaseMargin > 13 THEN
+               13
+           ELSE
+               Core_BaseMargin
+       END AS Initial_SMB02
+INTO #Final_Anchor_Buckets
+FROM #Calculated_Margins;
+
+
+SELECT *,
+       CASE
+           WHEN Initial_SMB02 < Initial_SMB01 THEN
+               Initial_SMB02
+           ELSE
+               Initial_SMB02
+       END AS SMB02_06_Final,
+       CASE
+           WHEN Initial_SMB02 < Initial_SMB01 THEN
+               CASE
+                   WHEN (Initial_SMB02 - 0.25) < 2.5 THEN
+                       2.5
+                   ELSE
+       (Initial_SMB02 - 0.25)
+               END
+           ELSE
+               Initial_SMB01
+       END AS SMB01_Final
+INTO #Interpolation_Setup
+FROM #Final_Anchor_Buckets;
+
+
+SELECT b.[ItemNo],
+       b.[Manufacturer Part No],
+       b.CostPrice,
+       ROUND(b.TargetMarginPct / 100.0, 4) AS [Wimood_Target_Margin],
+       ROUND(b.MedianAchievedMarginPct / 100.0, 4) AS [Median_Achieved_Margin_Pct],
+       -- I left this as RawCompetitorMargin so your final table still correctly SHOWS the 24.21% that was ignored
+       ROUND(b.RawCompetitorMarginPct / 100.0, 4) AS [Competitor_Margin_Pct], 
+       b.CompetitorStatus,
+       ROUND(b.SMB01_Final / 100.0, 4) AS [SMB01],
+       ROUND(b.SMB02_06_Final / 100.0, 4) AS [SMB02],
+       ROUND(b.SMB02_06_Final / 100.0, 4) AS [SMB03],
+       ROUND(b.SMB02_06_Final / 100.0, 4) AS [SMB04],
+       ROUND(b.SMB02_06_Final / 100.0, 4) AS [SMB05],
+       ROUND(b.SMB02_06_Final / 100.0, 4) AS [SMB06],
+       ROUND(   (b.SMB02_06_Final + (((CASE
+                                           WHEN b.SMB02_06_Final + 3 > 13 THEN
+                                               13
+                                           ELSE
+                                               b.SMB02_06_Final + 3
+                                       END
+                                      ) - b.SMB02_06_Final
+                                     ) * 1.0 / 8.0
+                                    )
+                ) / 100.0,
+                4
+            ) AS [SMB07],
+       ROUND(   (b.SMB02_06_Final + (((CASE
+                                           WHEN b.SMB02_06_Final + 3 > 13 THEN
+                                               13
+                                           ELSE
+                                               b.SMB02_06_Final + 3
+                                       END
+                                      ) - b.SMB02_06_Final
+                                     ) * 2.0 / 8.0
+                                    )
+                ) / 100.0,
+                4
+            ) AS [SMB08],
+       ROUND(   (b.SMB02_06_Final + (((CASE
+                                           WHEN b.SMB02_06_Final + 3 > 13 THEN
+                                               13
+                                           ELSE
+                                               b.SMB02_06_Final + 3
+                                       END
+                                      ) - b.SMB02_06_Final
+                                     ) * 3.0 / 8.0
+                                    )
+                ) / 100.0,
+                4
+            ) AS [SMB09],
+       ROUND(   (b.SMB02_06_Final + (((CASE
+                                           WHEN b.SMB02_06_Final + 3 > 13 THEN
+                                               13
+                                           ELSE
+                                               b.SMB02_06_Final + 3
+                                       END
+                                      ) - b.SMB02_06_Final
+                                     ) * 4.0 / 8.0
+                                    )
+                ) / 100.0,
+                4
+            ) AS [SMB10],
+       ROUND(   (b.SMB02_06_Final + (((CASE
+                                           WHEN b.SMB02_06_Final + 3 > 13 THEN
+                                               13
+                                           ELSE
+                                               b.SMB02_06_Final + 3
+                                       END
+                                      ) - b.SMB02_06_Final
+                                     ) * 5.0 / 8.0
+                                    )
+                ) / 100.0,
+                4
+            ) AS [SMB11],
+       ROUND(   (b.SMB02_06_Final + (((CASE
+                                           WHEN b.SMB02_06_Final + 3 > 13 THEN
+                                               13
+                                           ELSE
+                                               b.SMB02_06_Final + 3
+                                       END
+                                      ) - b.SMB02_06_Final
+                                     ) * 6.0 / 8.0
+                                    )
+                ) / 100.0,
+                4
+            ) AS [SMB12],
+       ROUND(   (b.SMB02_06_Final + (((CASE
+                                           WHEN b.SMB02_06_Final + 3 > 13 THEN
+                                               13
+                                           ELSE
+                                               b.SMB02_06_Final + 3
+                                       END
+                                      ) - b.SMB02_06_Final
+                                     ) * 7.0 / 8.0
+                                    )
+                ) / 100.0,
+                4
+            ) AS [SMB13],
+       ROUND(   (CASE
+                     WHEN b.SMB02_06_Final + 3 > 13 THEN
+                         13
+                     ELSE
+                         b.SMB02_06_Final + 3
+                 END
+                ) / 100.0,
+                4
+            ) AS [SMB14],
+       ROUND(   (CASE
+                     WHEN (b.SMB02_06_Final + (((CASE
+                                                     WHEN b.SMB02_06_Final + 3 > 13 THEN
+                                                         13
+                                                     ELSE
+                                                         b.SMB02_06_Final + 3
+                                                 END
+                                                ) - b.SMB02_06_Final
+                                               ) * 1.0 / 8.0
+                                              )
+                          ) + 3 > 13 THEN
+                         13
+                     ELSE
+                (b.SMB02_06_Final + (((CASE
+                                           WHEN b.SMB02_06_Final + 3 > 13 THEN
+                                               13
+                                           ELSE
+                                               b.SMB02_06_Final + 3
+                                       END
+                                      ) - b.SMB02_06_Final
+                                     ) * 1.0 / 8.0
+                                    )
+                ) + 3
+                 END
+                ) / 100.0,
+                4
+            ) AS [SMB15],
+       ROUND(   (CASE
+                     WHEN (b.SMB02_06_Final + (((CASE
+                                                     WHEN b.SMB02_06_Final + 3 > 13 THEN
+                                                         13
+                                                     ELSE
+                                                         b.SMB02_06_Final + 3
+                                                 END
+                                                ) - b.SMB02_06_Final
+                                               ) * 2.0 / 8.0
+                                              )
+                          ) + 3 > 13 THEN
+                         13
+                     ELSE
+                (b.SMB02_06_Final + (((CASE
+                                           WHEN b.SMB02_06_Final + 3 > 13 THEN
+                                               13
+                                           ELSE
+                                               b.SMB02_06_Final + 3
+                                       END
+                                      ) - b.SMB02_06_Final
+                                     ) * 2.0 / 8.0
+                                    )
+                ) + 3
+                 END
+                ) / 100.0,
+                4
+            ) AS [SMB16],
+       ROUND(   (CASE
+                     WHEN (b.SMB02_06_Final + (((CASE
+                                                     WHEN b.SMB02_06_Final + 3 > 13 THEN
+                                                         13
+                                                     ELSE
+                                                         b.SMB02_06_Final + 3
+                                                 END
+                                                ) - b.SMB02_06_Final
+                                               ) * 3.0 / 8.0
+                                              )
+                          ) + 3 > 13 THEN
+                         13
+                     ELSE
+                (b.SMB02_06_Final + (((CASE
+                                           WHEN b.SMB02_06_Final + 3 > 13 THEN
+                                               13
+                                           ELSE
+                                               b.SMB02_06_Final + 3
+                                       END
+                                      ) - b.SMB02_06_Final
+                                     ) * 3.0 / 8.0
+                                    )
+                ) + 3
+                 END
+                ) / 100.0,
+                4
+            ) AS [SMB17],
+       ROUND(   (CASE
+                     WHEN (b.SMB02_06_Final + (((CASE
+                                                     WHEN b.SMB02_06_Final + 3 > 13 THEN
+                                                         13
+                                                     ELSE
+                                                         b.SMB02_06_Final + 3
+                                                 END
+                                                ) - b.SMB02_06_Final
+                                               ) * 4.0 / 8.0
+                                              )
+                          ) + 3 > 13 THEN
+                         13
+                     ELSE
+                (b.SMB02_06_Final + (((CASE
+                                           WHEN b.SMB02_06_Final + 3 > 13 THEN
+                                               13
+                                           ELSE
+                                               b.SMB02_06_Final + 3
+                                       END
+                                      ) - b.SMB02_06_Final
+                                     ) * 4.0 / 8.0
+                                    )
+                ) + 3
+                 END
+                ) / 100.0,
+                4
+            ) AS [SMB18],
+       ROUND(   (CASE
+                     WHEN (b.SMB02_06_Final + (((CASE
+                                                     WHEN b.SMB02_06_Final + 3 > 13 THEN
+                                                         13
+                                                     ELSE
+                                                         b.SMB02_06_Final + 3
+                                                 END
+                                                ) - b.SMB02_06_Final
+                                               ) * 5.0 / 8.0
+                                              )
+                          ) + 3 > 13 THEN
+                         13
+                     ELSE
+                (b.SMB02_06_Final + (((CASE
+                                           WHEN b.SMB02_06_Final + 3 > 13 THEN
+                                               13
+                                           ELSE
+                                               b.SMB02_06_Final + 3
+                                       END
+                                      ) - b.SMB02_06_Final
+                                     ) * 5.0 / 8.0
+                                    )
+                ) + 3
+                 END
+                ) / 100.0,
+                4
+            ) AS [SMB19],
+       ROUND(   (CASE
+                     WHEN (b.SMB02_06_Final + (((CASE
+                                                     WHEN b.SMB02_06_Final + 3 > 13 THEN
+                                                         13
+                                                     ELSE
+                                                         b.SMB02_06_Final + 3
+                                                 END
+                                                ) - b.SMB02_06_Final
+                                               ) * 6.0 / 8.0
+                                              )
+                          ) + 3 > 13 THEN
+                         13
+                     ELSE
+                (b.SMB02_06_Final + (((CASE
+                                           WHEN b.SMB02_06_Final + 3 > 13 THEN
+                                               13
+                                           ELSE
+                                               b.SMB02_06_Final + 3
+                                       END
+                                      ) - b.SMB02_06_Final
+                                     ) * 6.0 / 8.0
+                                    )
+                ) + 3
+                 END
+                ) / 100.0,
+                4
+            ) AS [SMB20],
+       ISNULL(b.[supplierName], 'No comp data') AS [supplierName],
+       ISNULL(turn.[LTM Turnover (DKK)], 0) AS [LTM Turnover (DKK)]
+FROM #Interpolation_Setup b
+    LEFT JOIN #LTM_Turnover turn
+        ON b.ItemNo = turn.ItemNo;
